@@ -1,29 +1,38 @@
 ```
-# Compiled and build artifacts
-*.pyc
+# Python
 __pycache__/
-*.o
-*.obj
-*.so
-*.dll
-*.exe
-*.class
-*.out
-
-# Dependencies
-.venv/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
 venv/
-node_modules/
-target/
-.mypy_cache/
-.pytest_cache/
-.julia/
-zig*/
-julia-*/
-
-# Logs and temp files
+.venv/
+.ENV
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
 *.log
 *.tmp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Rust
+target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
 *.swp
 *.swo
 
@@ -32,17 +41,24 @@ julia-*/
 .env.local
 *.env.*
 
-# Editors
-.vscode/
-.idea/
-
 # Coverage
 coverage/
 htmlcov/
-.coverage
 
-# Build systems
-dist/
-build/
-.gradle/
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV
+.ENV
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
 ```
