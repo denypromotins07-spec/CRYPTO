@@ -4,11 +4,10 @@
 __pycache__/
 *.o
 *.obj
-*.class
-*.exe
-*.dll
 *.so
-*.a
+*.dll
+*.exe
+*.class
 *.out
 
 # Dependencies
@@ -35,15 +34,12 @@ target/
 .vscode/
 .idea/
 
-# OS specific
-.DS_Store
-Thumbs.db
-
 # Coverage
 coverage/
 htmlcov/
 .coverage
 
-# Rust specific
-Cargo.lock
+# Distribution artifacts
+dist/
+build/
 ```
