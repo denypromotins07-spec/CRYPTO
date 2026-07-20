@@ -1,38 +1,29 @@
 ```
-# Python
-__pycache__/
+# Compiled and build artifacts
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
+__pycache__/
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.class
+*.out
+
+# Dependencies
 .venv/
-.ENV
-.python-version
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
+venv/
+node_modules/
+target/
+.gradle/
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+
+# Logs and temp files
 *.log
 *.tmp
-*.swp
-*~
-.DS_Store
-Thumbs.db
-
-# Rust
-target/
-Cargo.lock
-
-# IDE
-.vscode/
-.idea/
 *.swp
 *.swo
 
@@ -41,24 +32,16 @@ Cargo.lock
 .env.local
 *.env.*
 
+# Editors
+.vscode/
+.idea/
+
 # Coverage
+.coverage
 coverage/
 htmlcov/
 
-# Distribution / packaging
-.Python
-env/
-venv/
-ENV
-.ENV
-.python-version
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
+# OS specific
+.DS_Store
+Thumbs.db
 ```
