@@ -5,43 +5,30 @@ __pycache__/
 *.o
 *.obj
 *.so
+*.a
 *.dll
 *.exe
-*.class
 *.out
-
 # Dependencies
 .venv/
 venv/
 node_modules/
 target/
-.gradle/
 .mypy_cache/
 .pytest_cache/
-dist/
-build/
-
 # Logs and temp files
 *.log
 *.tmp
 *.swp
-*.swo
-
 # Environment
 .env
 .env.local
 *.env.*
-
 # Editors
 .vscode/
 .idea/
-
 # Coverage
-.coverage
 coverage/
 htmlcov/
-
-# OS specific
-.DS_Store
-Thumbs.db
+.coverage
 ```
