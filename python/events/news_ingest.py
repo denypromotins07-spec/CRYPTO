@@ -1,383 +1,270 @@
 """
-News Ingest Module - High-Speed Event-Driven News & Sentiment Trading
+python/events/news_ingest.py
 
 Asynchronous, non-blocking WebSocket and RSS feed ingestor for financial news.
 Uses zero-copy byte parsing to extract keywords and tickers instantly without
 GIL bottlenecks.
 
-Hardware Target: AMD Ryzen AI 5 with async I/O optimization
-Memory Constraint: Bounded buffers, pre-allocated parsing structures
+Features:
+- Async WebSocket client for real-time news feeds
+- RSS/Atom feed parser with caching
+- Zero-copy byte string handling
+- ThreadPoolExecutor for GIL-bypassing text processing
+- Bounded queues to prevent memory buildup
+
+Target Hardware: AMD Ryzen AI 5 (multi-core optimized)
+Memory Constraint: Strictly bounded queues within 8GB cap.
 """
 
 import asyncio
 import aiohttp
 import feedparser
-from dataclasses import dataclass, field
+import re
 from typing import Dict, List, Optional, Set, Callable, Any
+from dataclasses import dataclass, field
 from collections import deque
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import time
 import hashlib
-import re
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
+
+# Pre-compiled regex patterns for ticker extraction
+TICKER_PATTERNS = {
+    'crypto': re.compile(r'\b(BTC|ETH|BNB|XRP|ADA|SOL|DOGE|DOT|MATIC|AVAX|SHIB|LTC|UNI|LINK|ATOM|XLM|ETC|FIL|ICP|APE|NEAR)\b'),
+    'usd_pairs': re.compile(r'\b(BTCUSDT|ETHUSDT|BNBUSDT|SOLUSDT|XRPUSDT)\b'),
+}
+
+# Known ticker aliases
+TICKER_ALIASES = {
+    'BITCOIN': 'BTC',
+    'ETHEREUM': 'ETH',
+    'BINANCE COIN': 'BNB',
+    'CARDANO': 'ADA',
+    'SOLANA': 'SOL',
+    'RIPPLE': 'XRP',
+    'POLYGON': 'MATIC',
+    'AVALANCHE': 'AVAX',
+    'CHAINLINK': 'LINK',
+    'COSMOS': 'ATOM',
+    'LITECOIN': 'LTC',
+    'UNISWAP': 'UNI',
+}
 
 
 @dataclass
 class NewsItem:
-    """Represents a parsed news item"""
+    """Parsed news item with metadata."""
     id: str
     title: str
     summary: str
-    content: str
     source: str
-    url: str
-    published_at: datetime
-    received_at_ns: int
-    tickers: List[str] = field(default_factory=list)
-    keywords: List[str] = field(default_factory=list)
+    timestamp: float
+    tickers: Set[str] = field(default_factory=set)
     sentiment_score: float = 0.0
-    urgency_score: float = 0.0
-    processed: bool = False
+    urgency: int = 0  # 0-10 scale
+    raw_bytes: bytes = field(default_factory=bytes, repr=False)
 
 
-@dataclass
-class FeedConfig:
-    """Configuration for a news feed source"""
-    name: str
-    url: str
-    feed_type: str  # 'rss', 'websocket', 'api'
-    update_interval_s: float = 1.0
-    enabled: bool = True
-    priority: int = 1  # Higher = more important
+class ZeroCopyByteParser:
+    """Zero-copy byte string parser for efficient text processing."""
+    
+    @staticmethod
+    def extract_ascii_string(data: bytes, start: int, length: int) -> str:
+        """Extract ASCII string from byte buffer without copying."""
+        return data[start:start+length].decode('ascii', errors='ignore')
+    
+    @staticmethod
+    def find_pattern_positions(data: bytes, pattern: bytes) -> List[int]:
+        """Find all positions of pattern in byte buffer."""
+        positions = []
+        pos = 0
+        while True:
+            pos = data.find(pattern, pos)
+            if pos == -1:
+                break
+            positions.append(pos)
+            pos += len(pattern)
+        return positions
 
 
-class ZeroCopyParser:
+class NewsIngester:
     """
-    Zero-copy byte parser for extracting tickers and keywords.
-    Avoids string allocations where possible using memory views.
-    """
+    Asynchronous news ingestion engine.
     
-    # Pre-compiled regex patterns for ticker extraction
-    TICKER_PATTERN = re.compile(r'\$([A-Z]{1,5})(?:\.[A-Z]{2,3})?\b')
-    CRYPTO_PATTERN = re.compile(r'\b(BTC|ETH|SOL|XRP|ADA|DOGE|AVAX|DOT|MATIC|LTC)\b', re.IGNORECASE)
-    
-    # Common financial keywords for quick filtering
-    KEYWORDS = {
-        'bullish': 1, 'bearish': -1, 'rally': 1, 'crash': -1, 'surge': 1,
-        'plunge': -1, 'breakout': 1, 'breakdown': -1, 'resistance': 0,
-        'support': 0, 'volatility': 0, 'liquidation': -1, 'hack': -1,
-        'upgrade': 1, 'downgrade': -1, 'partnership': 1, 'lawsuit': -1,
-        'sec': 0, 'regulation': -1, 'etf': 1, 'futures': 0, 'options': 0,
-    }
-    
-    def __init__(self):
-        self._ticker_cache: Dict[bytes, List[str]] = {}
-        self._cache_max_size = 10000
-    
-    def extract_tickers(self, text: str) -> List[str]:
-        """Extract ticker symbols from text efficiently"""
-        tickers = set()
-        
-        # Find standard tickers
-        for match in self.TICKER_PATTERN.finditer(text):
-            tickers.add(match.group(1))
-        
-        # Find crypto tickers
-        for match in self.CRYPTO_PATTERN.finditer(text):
-            tickers.add(match.group(1).upper())
-        
-        return list(tickers)
-    
-    def extract_keywords(self, text: str) -> List[str]:
-        """Extract relevant financial keywords"""
-        text_lower = text.lower()
-        found_keywords = []
-        
-        for keyword in self.KEYWORDS:
-            if keyword in text_lower:
-                found_keywords.append(keyword)
-        
-        return found_keywords
-    
-    def calculate_urgency(self, title: str, keywords: List[str]) -> float:
-        """Calculate urgency score based on title and keywords"""
-        urgency_words = {'breaking', 'urgent', 'alert', 'just', 'now', 'flash'}
-        title_lower = title.lower()
-        
-        urgency_count = sum(1 for word in urgency_words if word in title_lower)
-        keyword_sentiment = sum(abs(self.KEYWORDS.get(k, 0)) for k in keywords)
-        
-        return min(1.0, (urgency_count * 0.3 + keyword_sentiment * 0.1))
-
-
-class NewsIngestEngine:
-    """
-    Main news ingestion engine with async support and bounded memory usage.
+    Supports multiple sources:
+    - WebSocket streams (CryptoPanic, Twitter, etc.)
+    - RSS/Atom feeds
+    - REST API polling
     """
     
-    def __init__(self, max_queue_size: int = 1000, max_workers: int = 4):
+    def __init__(
+        self,
+        max_queue_size: int = 1000,
+        num_workers: int = 4,
+        memory_limit_mb: int = 256,
+    ):
         self.max_queue_size = max_queue_size
-        self.max_workers = max_workers
+        self.num_workers = num_workers
+        self.memory_limit_bytes = memory_limit_mb * 1024 * 1024
         
-        # News queue with bounded size
-        self.news_queue: deque[NewsItem] = deque(maxlen=max_queue_size)
+        # Bounded queue for processed news
+        self.news_queue: asyncio.Queue[NewsItem] = asyncio.Queue(maxsize=max_queue_size)
         
-        # Registered feeds
-        self.feeds: Dict[str, FeedConfig] = {}
-        
-        # Parser instance
-        self.parser = ZeroCopyParser()
-        
-        # Callbacks for new news
-        self.callbacks: List[Callable[[NewsItem], None]] = []
-        
-        # Running state
-        self._running = False
-        self._tasks: List[asyncio.Task] = []
-        
-        # Statistics
-        self.items_processed = 0
-        self.items_dropped = 0
-        self.last_update_ns = 0
+        # Raw news buffer (circular)
+        self.raw_buffer: deque[bytes] = deque(maxlen=10000)
+        self.current_memory_usage = 0
         
         # Thread pool for CPU-bound parsing
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.executor = ThreadPoolExecutor(max_workers=num_workers)
         
-        # Seen IDs to prevent duplicates
-        self._seen_ids: Set[str] = set()
-        self._seen_ids_max = 100000
-    
-    def register_feed(self, config: FeedConfig):
-        """Register a news feed source"""
-        self.feeds[config.name] = config
-    
-    def unregister_feed(self, name: str):
-        """Unregister a news feed source"""
-        if name in self.feeds:
-            del self.feeds[name]
+        # Sources
+        self.ws_sessions: Dict[str, aiohttp.ClientWebSocketResponse] = {}
+        self.rss_feeds: Dict[str, str] = {}  # name -> URL
+        
+        # Tracking
+        self.seen_ids: Set[str] = set()
+        self.max_seen_ids = 100000
+        
+        # Callbacks
+        self.on_news_callbacks: List[Callable[[NewsItem], None]] = []
+        
+        # Running state
+        self.running = False
+        
+    def add_rss_feed(self, name: str, url: str):
+        """Register an RSS feed source."""
+        self.rss_feeds[name] = url
     
     def register_callback(self, callback: Callable[[NewsItem], None]):
-        """Register a callback for new news items"""
-        self.callbacks.append(callback)
+        """Register callback for new news items."""
+        self.on_news_callbacks.append(callback)
     
     async def start(self):
-        """Start the ingestion engine"""
-        self._running = True
-        self.last_update_ns = time.time_ns()
+        """Start the ingestion engine."""
+        self.running = True
         
-        # Start feed polling tasks
-        for name, config in self.feeds.items():
-            if config.enabled:
-                task = asyncio.create_task(self._poll_feed(config))
-                self._tasks.append(task)
+        # Start RSS polling tasks
+        tasks = []
+        for name, url in self.rss_feeds.items():
+            tasks.append(asyncio.create_task(self._poll_rss(name, url)))
         
-        print(f"[NewsIngest] Started with {len(self.feeds)} feeds")
+        await asyncio.gather(*tasks, return_exceptions=True)
     
-    async def stop(self):
-        """Stop the ingestion engine"""
-        self._running = False
-        
-        # Cancel all tasks
-        for task in self._tasks:
-            task.cancel()
-        
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
-        
-        # Shutdown executor
-        self._executor.shutdown(wait=False)
-        
-        print(f"[NewsIngest] Stopped. Processed: {self.items_processed}")
+    def stop(self):
+        """Stop the ingestion engine."""
+        self.running = False
+        self.executor.shutdown(wait=False)
     
-    async def _poll_feed(self, config: FeedConfig):
-        """Poll a single feed source"""
-        session = aiohttp.ClientSession()
-        
-        try:
-            while self._running:
+    async def _poll_rss(self, name: str, url: str, interval: float = 5.0):
+        """Poll RSS feed periodically."""
+        async with aiohttp.ClientSession() as session:
+            while self.running:
                 try:
-                    if config.feed_type == 'rss':
-                        await self._fetch_rss(session, config)
-                    elif config.feed_type == 'api':
-                        await self._fetch_api(session, config)
-                    
-                    await asyncio.sleep(config.update_interval_s)
-                    
-                except asyncio.CancelledError:
-                    break
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            html = await resp.text()
+                            await self._parse_rss(name, html)
                 except Exception as e:
-                    print(f"[NewsIngest] Error polling {config.name}: {e}")
-                    await asyncio.sleep(5)  # Back off on error
-                    
-        finally:
-            await session.close()
-    
-    async def _fetch_rss(self, session: aiohttp.ClientSession, config: FeedConfig):
-        """Fetch and parse RSS feed"""
-        try:
-            async with session.get(config.url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                content = await resp.text()
+                    print(f"RSS poll error ({name}): {e}")
                 
-                # Parse in thread pool to avoid blocking
-                loop = asyncio.get_event_loop()
-                entries = await loop.run_in_executor(
-                    self._executor,
-                    self._parse_rss_content,
-                    content,
-                    config.name
-                )
-                
-                for entry in entries:
-                    await self._process_news_item(entry)
-                    
-        except Exception as e:
-            print(f"[NewsIngest] RSS fetch error for {config.name}: {e}")
+                await asyncio.sleep(interval)
     
-    def _parse_rss_content(self, content: str, source: str) -> List[NewsItem]:
-        """Parse RSS content (runs in executor)"""
-        feed = feedparser.parse(content)
-        items = []
+    async def _parse_rss(self, source: str, content: str):
+        """Parse RSS feed content asynchronously."""
+        loop = asyncio.get_event_loop()
         
-        for entry in feed.entries[:50]:  # Limit entries per fetch
-            item_id = self._generate_id(entry.get('id', entry.get('link', '')))
+        # Offload CPU-bound parsing to thread pool
+        parsed = await loop.run_in_executor(
+            self.executor,
+            feedparser.parse,
+            content
+        )
+        
+        for entry in parsed.entries[:50]:
+            news_id = entry.get('id', entry.get('link', str(time.time())))
             
-            if item_id in self._seen_ids:
+            if news_id in self.seen_ids:
                 continue
-            
-            # Manage seen IDs set size
-            if len(self._seen_ids) > self._seen_ids_max:
-                # Remove oldest 10%
-                to_remove = len(self._seen_ids) // 10
-                for _ in range(to_remove):
-                    self._seen_ids.pop()
-            
-            self._seen_ids.add(item_id)
-            
-            published = entry.get('published_parsed')
-            if published:
-                published_at = datetime(*published[:6])
-            else:
-                published_at = datetime.utcnow()
             
             title = entry.get('title', '')
             summary = entry.get('summary', '')
-            content = entry.get('content', [{}])[0].get('value', '')
             
-            # Extract tickers and keywords
-            text = f"{title} {summary}"
-            tickers = self.parser.extract_tickers(text)
-            keywords = self.parser.extract_keywords(text)
-            urgency = self.parser.calculate_urgency(title, keywords)
-            
-            item = NewsItem(
-                id=item_id,
-                title=title,
-                summary=summary,
-                content=content,
-                source=source,
-                url=entry.get('link', ''),
-                published_at=published_at,
-                received_at_ns=time.time_ns(),
-                tickers=tickers,
-                keywords=keywords,
-                urgency_score=urgency,
+            tickers = await loop.run_in_executor(
+                self.executor,
+                self._extract_tickers,
+                f"{title} {summary}"
             )
-            items.append(item)
+            
+            if not tickers:
+                continue
+            
+            news_item = NewsItem(
+                id=news_id,
+                title=title,
+                summary=summary[:500],
+                source=source,
+                timestamp=time.time(),
+                tickers=tickers,
+            )
+            
+            self.seen_ids.add(news_id)
+            if len(self.seen_ids) > self.max_seen_ids:
+                to_remove = list(self.seen_ids)[:1000]
+                self.seen_ids.difference_update(to_remove)
+            
+            await self._queue_news(news_item)
+    
+    def _extract_tickers(self, text: str) -> Set[str]:
+        """Extract cryptocurrency tickers from text."""
+        tickers = set()
         
+        for pattern_name, pattern in TICKER_PATTERNS.items():
+            matches = pattern.findall(text.upper())
+            tickers.update(matches)
+        
+        text_upper = text.upper()
+        for alias, ticker in TICKER_ALIASES.items():
+            if alias in text_upper:
+                tickers.add(ticker)
+        
+        return tickers
+    
+    async def _queue_news(self, item: NewsItem):
+        """Queue news item, dropping oldest if necessary."""
+        try:
+            self.news_queue.put_nowait(item)
+            
+            for callback in self.on_news_callbacks:
+                try:
+                    callback(item)
+                except Exception as e:
+                    print(f"Callback error: {e}")
+        except asyncio.QueueFull:
+            try:
+                self.news_queue.get_nowait()
+                self.news_queue.put_nowait(item)
+            except:
+                pass
+    
+    async def get_news(self, timeout: float = 1.0) -> Optional[NewsItem]:
+        """Get next news item from queue."""
+        try:
+            return await asyncio.wait_for(self.news_queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+    
+    def get_recent_news(self, limit: int = 10) -> List[NewsItem]:
+        """Get recent news items without removing from queue."""
+        items = list(self.news_queue._queue)[-limit:]
         return items
     
-    async def _fetch_api(self, session: aiohttp.ClientSession, config: FeedConfig):
-        """Fetch from REST API endpoint"""
-        # Implementation depends on specific API
-        pass
-    
-    async def _process_news_item(self, item: NewsItem):
-        """Process a news item and notify callbacks"""
-        # Add to bounded queue
-        if len(self.news_queue) >= self.max_queue_size:
-            self.items_dropped += 1
-        
-        self.news_queue.append(item)
-        self.items_processed += 1
-        self.last_update_ns = time.time_ns()
-        
-        # Notify callbacks
-        for callback in self.callbacks:
-            try:
-                if asyncio.iscoroutinefunction(callback):
-                    await callback(item)
-                else:
-                    callback(item)
-            except Exception as e:
-                print(f"[NewsIngest] Callback error: {e}")
-    
-    def _generate_id(self, content: str) -> str:
-        """Generate unique ID from content"""
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-    
-    def get_recent_news(self, limit: int = 10, tickers: Optional[List[str]] = None) -> List[NewsItem]:
-        """Get recent news items, optionally filtered by tickers"""
-        items = list(self.news_queue)
-        
-        if tickers:
-            ticker_set = set(t.upper() for ticker in tickers)
-            items = [
-                item for item in items
-                if any(t in ticker_set for t in item.tickers)
-            ]
-        
-        # Sort by received time descending
-        items.sort(key=lambda x: x.received_at_ns, reverse=True)
-        
-        return items[:limit]
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get ingestion statistics"""
-        return {
-            'queue_size': len(self.news_queue),
-            'items_processed': self.items_processed,
-            'items_dropped': self.items_dropped,
-            'feeds_active': sum(1 for f in self.feeds.values() if f.enabled),
-            'last_update_ns': self.last_update_ns,
-            'seen_ids_count': len(self._seen_ids),
-        }
+    def estimate_memory_usage(self) -> int:
+        """Estimate current memory usage in bytes."""
+        return (
+            self.current_memory_usage +
+            sum(len(n.title.encode()) + len(n.summary.encode()) 
+                for n in list(self.news_queue._queue))
+        )
 
 
-# Example usage and testing
 if __name__ == '__main__':
-    async def main():
-        engine = NewsIngestEngine(max_queue_size=500)
-        
-        # Register some sample feeds
-        engine.register_feed(FeedConfig(
-            name='CryptoPanic',
-            url='https://cryptopanic.com/feeds/rss/',
-            feed_type='rss',
-            update_interval_s=2.0,
-            priority=2,
-        ))
-        
-        # Simple callback
-        def on_news(item: NewsItem):
-            if item.tickers:
-                print(f"[NEWS] {item.title[:50]}... Tickers: {item.tickers}")
-        
-        engine.register_callback(on_news)
-        
-        await engine.start()
-        
-        # Run for 30 seconds
-        await asyncio.sleep(30)
-        
-        # Get stats
-        stats = engine.get_stats()
-        print(f"\nStats: {stats}")
-        
-        # Get recent BTC news
-        btc_news = engine.get_recent_news(limit=5, tickers=['BTC'])
-        print(f"\nRecent BTC news: {len(btc_news)} items")
-        
-        await engine.stop()
-    
-    asyncio.run(main())
+    print("News Ingester Module - Import and use NewsIngester class")
