@@ -4,10 +4,11 @@
 __pycache__/
 *.o
 *.obj
-*.so
-*.dll
-*.exe
 *.class
+*.exe
+*.dll
+*.so
+*.a
 *.out
 
 # Dependencies
@@ -34,12 +35,14 @@ target/
 .vscode/
 .idea/
 
-# Coverage
+# Build and distribution
+dist/
+build/
 coverage/
 htmlcov/
 .coverage
 
-# Distribution artifacts
-dist/
-build/
+# System files
+.DS_Store
+Thumbs.db
 ```
